@@ -3,20 +3,20 @@ package k3sbasedupgrade
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-semver/semver"
 	v32 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	v33 "github.com/rancher/rancher/pkg/apis/project.cattle.io/v3"
-	app2 "github.com/rancher/rancher/pkg/app"
+	helmcfg "github.com/rancher/rancher/pkg/catalogv2/helm"
 	v3 "github.com/rancher/rancher/pkg/generated/norman/management.cattle.io/v3"
-	"github.com/rancher/rancher/pkg/namespace"
-	"github.com/rancher/rancher/pkg/project"
-	"github.com/rancher/rancher/pkg/ref"
+	"github.com/rancher/rancher/pkg/wrangler"
 	planv1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
-	"github.com/sirupsen/logrus"
-	"k8s.io/apimachinery/pkg/api/errors"
+	"helm.sh/helm/v3/pkg/action"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/restmapper"
 )
 
 const (
@@ -109,121 +109,75 @@ func (h *handler) deployK3sBasedUpgradeController(clusterName, updateVersion str
 		return err
 	}
 
-	projectLister := userCtx.Management.Management.Projects("").Controller().Lister()
-	systemProject, err := project.GetSystemProject(clusterName, projectLister)
+	// TODO - FIND A WAY OF GETTING THIS FROM THE DOWNSTREAM  CLUSTER.
+	s := userCtx.Management.Management.Settings("")
+	upgradeTest, err := s.Get("system-upgrade-test", metav1.GetOptions{})
 	if err != nil {
-		return err
+		panic(err.Error())
+	}
+	if upgradeTest.Value != updateVersion {
+		settingsCopy := upgradeTest.DeepCopy()
+		settingsCopy.Value = updateVersion
+		if _, err := s.Update(settingsCopy); err != nil {
+			panic(err)
+		}
 	}
 
-	templateID := k3sUpgraderCatalogName
-	template, err := h.templateLister.Get(namespace.GlobalNamespace, templateID)
-	if err != nil {
-		return err
+	// Interact with helm
+	cache := memory.NewMemCacheClient(userCtx.K8sClient.Discovery())
+	restMapper := restmapper.NewDeferredDiscoveryRESTMapper(cache)
+
+	restClientGetter := &wrangler.SimpleRESTClientGetter{
+		ClientConfig:    nil, // The Manager don't use the ClientConfig. Therefore, we can pass this as nill.
+		RESTConfig:      &userCtx.RESTConfig,
+		CachedDiscovery: cache,
+		RESTMapper:      restMapper,
 	}
 
-	latestTemplateVersion, err := h.catalogManager.LatestAvailableTemplateVersion(template, clusterName)
-	if err != nil {
-		return err
-	}
+	helmClient := helmcfg.NewClient(restClientGetter)
 
-	creator, err := h.systemAccountManager.GetSystemUser(clusterName)
-	if err != nil {
-		return err
-	}
-	systemProjectID := ref.Ref(systemProject)
-	_, systemProjectName := ref.Parse(systemProjectID)
+	// Other Aactions.
+	// 	action.ListPendingInstall|action.ListPendingUpgrade|action.ListPendingRollback
 
-	nsClient := userCtx.Core.Namespaces("")
-	appProjectName, err := app2.EnsureAppProjectName(nsClient, systemProjectName, clusterName, systemUpgradeNS, creator.Name)
-	if err != nil {
-		return err
-	}
+	shouldPspBeEnabled, err := Is125OrAbove(updateVersion)
 
-	// determine what version of Kubernetes we are updating to
-	is125OrAbove, err := Is125OrAbove(updateVersion)
-	if err != nil {
-		return err
-	}
-
-	// if we are using a version above or equal to 1.25 we need to explicitly disable PSPs
-	enablePSPInChart := "false"
-	if !is125OrAbove {
-		enablePSPInChart = "true"
-	}
-
-	appLister := userCtx.Management.Project.Apps("").Controller().Lister()
-	appClient := userCtx.Management.Project.Apps("")
-
-	latestVersionID := latestTemplateVersion.ExternalID
-	var appname string
-	switch {
-	case isK3s:
-		appname = "rancher-k3s-upgrader"
-	case isRke2:
-		appname = "rancher-rke2-upgrader"
-	}
-	app, err := appLister.Get(systemProjectName, appname)
-	if err != nil {
-		if !errors.IsNotFound(err) {
+	for { // This can be improved, first draft.
+		time.Sleep(5 * time.Second)
+		releasedCharts, err := helmClient.ListReleases("cattle-system", "system-upgrade-controller", action.ListDeployed)
+		if err != nil {
 			return err
 		}
-		desiredApp := &v33.App{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      appname,
-				Namespace: systemProjectName,
-				Annotations: map[string]string{
-					"field.cattle.io/creatorId": creator.Name,
-				},
-			},
-			Spec: v33.AppSpec{
-				Description:     "Upgrade controller for k3s based clusters",
-				ExternalID:      latestVersionID,
-				ProjectName:     appProjectName,
-				Answers:         make(map[string]string),
-				TargetNamespace: systemUpgradeNS,
-			},
-		}
-
-		desiredApp.Spec.Answers[PSPAnswersField] = enablePSPInChart
-
-		// k3s upgrader doesn't exist yet, so it will need to be created
-		if _, err = appClient.Create(desiredApp); err != nil {
-			return err
-		}
-	} else {
-		if !checkDeployed(app) {
-			if !v33.AppConditionForceUpgrade.IsUnknown(app) {
-				v33.AppConditionForceUpgrade.Unknown(app)
+		for _, release := range releasedCharts {
+			// Ignore other charts.
+			if release.Name != "system-upgrade-controller" {
+				continue
 			}
-			logrus.Warnln("force redeploying system-upgrade-controller")
-			if _, err = appClient.Update(app); err != nil {
+			// Get the chart config.
+			values := release.Config
+			g, e := values["global"].(map[string]interface{})
+			if !e {
+				continue
+			}
+			psp, e := g["psp"].(map[string]interface{})
+			if !e {
+				continue
+			}
+			isEnabled, e := psp["enabled"].(bool)
+			if !e {
+				continue
+			}
+
+			if err != nil {
 				return err
 			}
-		}
-
-		externalIDIsCorrect := app.Spec.ExternalID == latestVersionID
-		pspValuesHaveBeenSet := false
-		if app.Spec.Answers != nil {
-			pspValuesHaveBeenSet = app.Spec.Answers[PSPAnswersField] == enablePSPInChart
-		}
-
-		// everything is up-to-date and PSP attributes are set up properly, no need to update.
-		if externalIDIsCorrect && pspValuesHaveBeenSet {
-			return nil
-		}
-
-		desiredApp := app.DeepCopy()
-		if desiredApp.Spec.Answers == nil {
-			desiredApp.Spec.Answers = make(map[string]string)
-		}
-		desiredApp.Spec.Answers[PSPAnswersField] = enablePSPInChart
-		desiredApp.Spec.ExternalID = latestVersionID
-		// new version of k3s upgrade available, or the valuesYaml have changed, update app
-		if _, err = appClient.Update(desiredApp); err != nil {
-			return err
+			// Check if the downstream is equal what it is suposed to be.
+			if isEnabled == shouldPspBeEnabled {
+				return nil
+			} else {
+				break // If it is not right we can break the inner loop, going back to sleep.
+			}
 		}
 	}
-
 	return nil
 }
 

@@ -49,6 +49,7 @@ var (
 		"cattle-elemental-system",
 	}
 
+	TestSystemUpgradeController         = NewSetting("system-upgrade-test", "")
 	AgentImage                          = NewSetting("agent-image", "rancher/rancher-agent:v2.8-head")
 	AgentRolloutTimeout                 = NewSetting("agent-rollout-timeout", "300s")
 	AgentRolloutWait                    = NewSetting("agent-rollout-wait", "true")

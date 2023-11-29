@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Masterminds/semver/v3"
+	semv "github.com/coreos/go-semver/semver"
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/rancher/rancher/pkg/api/steve/catalog/types"
 	catalog "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
@@ -39,6 +41,39 @@ var (
 		},
 	}
 )
+
+// Is125OrAbove determines if a particular Kubernetes version is
+// equal to or greater than 1.25.0
+func Is125OrAbove(version string) (bool, error) {
+	return IsNewerVersion("v1.24.99", version)
+}
+
+// IsNewerVersion returns true if updated versions semver is newer and false if its
+// semver is older. If semver is equal then metadata is alphanumerically compared.
+func IsNewerVersion(prevVersion, updatedVersion string) (bool, error) {
+	parseErrMsg := "failed to parse version: %v"
+	prevVer, err := semv.NewVersion(strings.TrimPrefix(prevVersion, "v"))
+	if err != nil {
+		return false, fmt.Errorf(parseErrMsg, err)
+	}
+
+	updatedVer, err := semv.NewVersion(strings.TrimPrefix(updatedVersion, "v"))
+	if err != nil {
+		return false, fmt.Errorf(parseErrMsg, err)
+	}
+
+	switch updatedVer.Compare(*prevVer) {
+	case -1:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		// using metadata to determine precedence is against semver standards
+		// this is ignored because it because k3s uses it to precedence between
+		// two versions based on same k8s version
+		return updatedVer.Metadata > prevVer.Metadata, nil
+	}
+}
 
 type desiredKey struct {
 	namespace            string
@@ -116,8 +151,41 @@ func (m *Manager) Start(ctx context.Context) {
 	m.ctx = ctx
 	go m.runSync()
 
+	m.settings.OnChange(ctx, "system-upgrade-test", m.systemUpgrade)
+
 	m.settings.OnChange(ctx, "system-feature-chart-refresh", m.onSetting)
 	m.clusterRepos.OnChange(ctx, "catalog-refresh-trigger", m.onTrigger)
+}
+
+func (m *Manager) systemUpgrade(key string, obj *v3.Setting) (*v3.Setting, error) {
+	if key != "system-upgrade-test" {
+		return obj, nil
+	}
+
+	if obj.Value == "" {
+		return obj, nil
+	}
+
+	is125OrAbove, err := Is125OrAbove(obj.Value)
+	if err != nil {
+		logrus.Errorf("Unable to parse kubernetes version: %s, skipping system-upgrade-controller install", obj.Value)
+		return obj, err
+	}
+	value := map[string]interface{}{
+		"global": map[string]interface{}{
+			"cattle": map[string]interface{}{
+				"systemDefaultRegistry": settings.SystemDefaultRegistry.Get(),
+				"psp": map[string]interface{}{
+					"enabled": !is125OrAbove,
+				},
+			},
+		},
+	}
+	if err := m.Ensure("cattle-system", "system-upgrade-controller",
+		"", settings.SystemUpgradeControllerChartVersion.Get(), value, true, ""); err != nil {
+		return obj, err
+	}
+	return obj, nil
 }
 
 func (m *Manager) onSetting(key string, obj *v3.Setting) (*v3.Setting, error) {
